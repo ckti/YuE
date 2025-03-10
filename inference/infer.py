@@ -1,5 +1,6 @@
 import os
 import sys
+from mmgp import offload
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xcodec_mini_infer'))
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xcodec_mini_infer', 'descriptaudiocodec'))
 import re
@@ -23,7 +24,6 @@ from models.soundstream_hubert_new import SoundStream
 from vocoder import build_codec_model, process_audio
 from post_process_audio import replace_low_freq_with_energy_matched
 
-
 parser = argparse.ArgumentParser()
 # Model Configuration:
 parser.add_argument("--stage1_model", type=str, default="m-a-p/YuE-s1-7B-anneal-en-cot", help="The model checkpoint path or identifier for the Stage 1 model.")
@@ -33,8 +33,8 @@ parser.add_argument("--repetition_penalty", type=float, default=1.1, help="repet
 parser.add_argument("--run_n_segments", type=int, default=2, help="The number of segments to process during the generation.")
 parser.add_argument("--stage2_batch_size", type=int, default=4, help="The batch size used in Stage 2 inference.")
 # Prompt
-parser.add_argument("--genre_txt", type=str, required=True, help="The file path to a text file containing genre tags that describe the musical style or characteristics (e.g., instrumental, genre, mood, vocal timbre, vocal gender). This is used as part of the generation prompt.")
-parser.add_argument("--lyrics_txt", type=str, required=True, help="The file path to a text file containing the lyrics for the music generation. These lyrics will be processed and split into structured segments to guide the generation process.")
+parser.add_argument("--genre_txt", type=str, help="The file path to a text file containing genre tags that describe the musical style or characteristics (e.g., instrumental, genre, mood, vocal timbre, vocal gender). This is used as part of the generation prompt.")
+parser.add_argument("--lyrics_txt", type=str, help="The file path to a text file containing the lyrics for the music generation. These lyrics will be processed and split into structured segments to guide the generation process.")
 parser.add_argument("--use_audio_prompt", action="store_true", help="If set, the model will use an audio file as a prompt during generation. The audio file should be specified using --audio_prompt_path.")
 parser.add_argument("--audio_prompt_path", type=str, default="", help="The file path to an audio file to use as a reference prompt when --use_audio_prompt is enabled.")
 parser.add_argument("--prompt_start_time", type=float, default=0.0, help="The start time in seconds to extract the audio prompt from the given audio file.")
@@ -55,9 +55,31 @@ parser.add_argument('--config_path', type=str, default='./xcodec_mini_infer/deco
 parser.add_argument('--vocal_decoder_path', type=str, default='./xcodec_mini_infer/decoders/decoder_131000.pth', help='Path to Vocos decoder weights.')
 parser.add_argument('--inst_decoder_path', type=str, default='./xcodec_mini_infer/decoders/decoder_151000.pth', help='Path to Vocos decoder weights.')
 parser.add_argument('-r', '--rescale', action='store_true', help='Rescale output to avoid clipping.')
-
+parser.add_argument("--profile", type=int, default=3)
+parser.add_argument("--verbose", type=int, default=1)
+parser.add_argument("--compile", action="store_true")
+parser.add_argument("--icl", action="store_true")
 
 args = parser.parse_args()
+profile = args.profile
+compile = args.compile
+sdpa = args.sdpa
+use_icl = args.icl
+
+if use_icl:
+    args.stage1_model="m-a-p/YuE-s1-7B-anneal-en-icl"
+else:
+    args.stage1_model="m-a-p/YuE-s1-7B-anneal-en-cot"
+
+args.stage2_batch_size= [20,20,20,4,3,2][profile]   
+
+if sdpa:
+    attn_implementation="sdpa"
+else:
+    attn_implementation="flash_attention_2"
+
+
+
 if args.use_audio_prompt and not args.audio_prompt_path:
     raise FileNotFoundError("Please offer audio prompt filepath using '--audio_prompt_path', when you enable 'use_audio_prompt'!")
 if args.use_dual_tracks_prompt and not args.vocal_track_prompt_path and not args.instrumental_track_prompt_path:
@@ -84,15 +106,29 @@ mmtokenizer = _MMSentencePieceTokenizer("./mm_tokenizer_v0.2_hf/tokenizer.model"
 model = AutoModelForCausalLM.from_pretrained(
     stage1_model, 
     torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2", # To enable flashattn, you have to install flash-attn
-    # device_map="auto",
+    attn_implementation=attn_implementation, # To enable flashattn, you have to install flash-attn
     )
 # to device, if gpu is available
-model.to(device)
+model.to("cpu")
 model.eval()
 
-if torch.__version__ >= "2.0.0":
-    model = torch.compile(model)
+model_stage2 = AutoModelForCausalLM.from_pretrained(
+    stage2_model, 
+    torch_dtype=torch.float16,
+    attn_implementation=attn_implementation
+    )
+model_stage2.to("cpu")
+model_stage2.eval()
+
+# remove test on arguments for method 'model.generate' in case transformers patch not applied
+def nop(nada):
+    pass
+model._validate_model_kwargs = nop
+model_stage2._validate_model_kwargs = nop
+
+pipe = { "transformer" :model , "stage2" :model_stage2    }
+
+quantizeTransformer = profile == 3 or profile == 4 or profile == 5 
 
 codectool = CodecManipulator("xcodec", 0, 1)
 codectool_stage2 = CodecManipulator("xcodec", 0, 8)
@@ -103,6 +139,8 @@ codec_model.load_state_dict(parameter_dict['codec_model'])
 codec_model.to(device)
 codec_model.eval()
 
+offload.profile(pipe, profile_no = profile, quantizeTransformer= quantizeTransformer, compile = compile, verboseLevel= args.verbose ) 
+    
 class BlockTokenRangeProcessor(LogitsProcessor):
     def __init__(self, start_id, end_id):
         self.blocked_token_ids = list(range(start_id, end_id))
@@ -244,8 +282,8 @@ for i in range(range_begin, len(soa_idx)):
     instrumentals.append(instrumentals_ids)
 vocals = np.concatenate(vocals, axis=1)
 instrumentals = np.concatenate(instrumentals, axis=1)
-vocal_save_path = os.path.join(stage1_output_dir, f"{genres.replace(' ', '-')}_tp{top_p}_T{temperature}_rp{repetition_penalty}_maxtk{max_new_tokens}_{random_id}_vtrack".replace('.', '@')+'.npy')
-inst_save_path = os.path.join(stage1_output_dir, f"{genres.replace(' ', '-')}_tp{top_p}_T{temperature}_rp{repetition_penalty}_maxtk{max_new_tokens}_{random_id}_itrack".replace('.', '@')+'.npy')
+vocal_save_path = os.path.join(stage1_output_dir, f"{output_filename_base}_vtrack.npy")
+inst_save_path = os.path.join(stage1_output_dir, f"{output_filename_base}_itrack.npy")
 np.save(vocal_save_path, vocals)
 np.save(inst_save_path, instrumentals)
 stage1_output_set.append(vocal_save_path)
@@ -253,20 +291,19 @@ stage1_output_set.append(inst_save_path)
 
 
 # offload model
-if not args.disable_offload_model:
-    model.cpu()
-    del model
-    torch.cuda.empty_cache()
+# if not args.disable_offload_model:
+#     model.cpu()
+#     del model
+#     torch.cuda.empty_cache()
 
 print("Stage 2 inference...")
-model_stage2 = AutoModelForCausalLM.from_pretrained(
-    stage2_model, 
-    torch_dtype=torch.bfloat16,
-    attn_implementation="flash_attention_2",
-    # device_map="auto",
-    )
-model_stage2.to(device)
-model_stage2.eval()
+# model_stage2 = AutoModelForCausalLM.from_pretrained(
+#     stage2_model, 
+#     torch_dtype=torch.float16,
+#     attn_implementation="flash_attention_2"
+#     )
+# model_stage2.to(device)
+# model_stage2.eval()
 
 if torch.__version__ >= "2.0.0":
     model_stage2 = torch.compile(model_stage2)
@@ -421,7 +458,7 @@ for npy in stage2_result:
     with torch.no_grad():
         decoded_waveform = codec_model.decode(torch.as_tensor(codec_result.astype(np.int16), dtype=torch.long).unsqueeze(0).permute(1, 0, 2).to(device))
     decoded_waveform = decoded_waveform.cpu().squeeze(0)
-    decodec_rlt.append(torch.as_tensor(decoded_waveform))
+    decodec_rlt.append(torch.as_tensor(decoded_waveform, device ="cpu"))
     decodec_rlt = torch.cat(decodec_rlt, dim=-1)
     save_path = os.path.join(recons_output_dir, os.path.splitext(os.path.basename(npy))[0] + ".mp3")
     tracks.append(save_path)
